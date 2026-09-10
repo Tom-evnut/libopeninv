@@ -76,8 +76,9 @@ static const CANSPEED canSpeed[CanHardware::BaudLast] =
    { CAN_BTR_TS1_13TQ, CAN_BTR_TS2_2TQ, 4 }, //250kbps at 16 MHz
    { CAN_BTR_TS1_13TQ, CAN_BTR_TS2_2TQ, 2 }, //500kbps at 16 MHz
    { CAN_BTR_TS1_8TQ,  CAN_BTR_TS2_1TQ, 2 }, //800kbps at 16 MHz
-   { CAN_BTR_TS1_13TQ, CAN_BTR_TS2_2TQ, 1 }, //1000kbps at 36 MHz
+   { CAN_BTR_TS1_13TQ, CAN_BTR_TS2_2TQ, 1 }, //1000kbps at 16 MHz
    { CAN_BTR_TS1_11TQ, CAN_BTR_TS2_4TQ, 30 }, //33.3kbps at 16 MHz
+   { CAN_BTR_TS1_15TQ, CAN_BTR_TS2_4TQ, 8 }, //100kbps at 16 MHz
 };
 #elif CAN_PERIPH_SPEED == 32
 {
@@ -87,6 +88,7 @@ static const CANSPEED canSpeed[CanHardware::BaudLast] =
    { CAN_BTR_TS1_8TQ,  CAN_BTR_TS2_1TQ, 4 }, //800kbps at 32 MHz
    { CAN_BTR_TS1_13TQ, CAN_BTR_TS2_2TQ, 2 }, //1000kbps at 32 MHz
    { CAN_BTR_TS1_11TQ, CAN_BTR_TS2_4TQ, 60 }, //33.3kbps at 32 MHz
+   { CAN_BTR_TS1_15TQ, CAN_BTR_TS2_4TQ, 16}, //100kbps at 32 MHz
 };
 #elif CAN_PERIPH_SPEED == 36
 {
@@ -96,6 +98,7 @@ static const CANSPEED canSpeed[CanHardware::BaudLast] =
    { CAN_BTR_TS1_5TQ, CAN_BTR_TS2_3TQ, 5 }, //800kbps at 36 MHz
    { CAN_BTR_TS1_6TQ, CAN_BTR_TS2_5TQ, 3 }, //1000kbps at 36 MHz
    { CAN_BTR_TS1_8TQ, CAN_BTR_TS2_3TQ, 90}, //33.3kbps at 36 MHz
+   { CAN_BTR_TS1_15TQ, CAN_BTR_TS2_4TQ, 18}, //100kbps at 36 MHz
 };
 #else
 #error Unhandled CAN peripheral speed, please define prescalers
@@ -222,38 +225,22 @@ void Stm32Can::SetBaudrate(enum baudrates baudrate)
  * \return void
  *
  */
-void Stm32Can::Send(uint32_t canId, uint32_t data[2], uint8_t len, bool ext)
+void Stm32Can::Send(uint32_t canId, uint32_t data[2], uint8_t len, bool forceExt)
 {
    DISABLE_CAN_USER_INTERRUPTS();
 
    can_disable_irq(canDev, CAN_IER_TMEIE);
 
-   if(ext)
+   if (can_transmit(canDev, canId, (canId > 0x7FF) | forceExt, false, len, (uint8_t*)data) < 0 && sendCnt < SENDBUFFER_LEN)
    {
-     if (can_transmit(canDev, canId, ext, false, len, (uint8_t*)data) < 0 && sendCnt < SENDBUFFER_LEN)
-     {
-        /* enqueue in send buffer if all TX mailboxes are full */
-        sendBuffer[sendCnt].id = canId;
-        sendBuffer[sendCnt].len = len;
-        sendBuffer[sendCnt].data[0] = data[0];
-        sendBuffer[sendCnt].data[1] = data[1];
-        sendCnt++;
-     }
+      /* enqueue in send buffer if all TX mailboxes are full */
+      sendBuffer[sendCnt].id = canId;
+      sendBuffer[sendCnt].forceExt = forceExt;
+      sendBuffer[sendCnt].len = len;
+      sendBuffer[sendCnt].data[0] = data[0];
+      sendBuffer[sendCnt].data[1] = data[1];
+      sendCnt++;
    }
-   else
-   {
-     if (can_transmit(canDev, canId, canId > 0x7FF, false, len, (uint8_t*)data) < 0 && sendCnt < SENDBUFFER_LEN)
-     {
-        /* enqueue in send buffer if all TX mailboxes are full */
-        sendBuffer[sendCnt].id = canId;
-        sendBuffer[sendCnt].len = len;
-        sendBuffer[sendCnt].data[0] = data[0];
-        sendBuffer[sendCnt].data[1] = data[1];
-        sendCnt++;
-     }
-
-   }
-
 
    if (sendCnt > 0)
    {
@@ -290,7 +277,7 @@ void Stm32Can::HandleTx()
 {
    SENDBUFFER* b = sendBuffer; //alias
 
-   while (sendCnt > 0 && can_transmit(canDev, b[sendCnt - 1].id, b[sendCnt - 1].id > 0x7FF, false, b[sendCnt - 1].len, (uint8_t*)b[sendCnt - 1].data) >= 0)
+   while (sendCnt > 0 && can_transmit(canDev, b[sendCnt - 1].id, (b[sendCnt - 1].id > 0x7FF) | b[sendCnt - 1].forceExt, false, b[sendCnt - 1].len, (uint8_t*)b[sendCnt - 1].data) >= 0)
       sendCnt--;
 
    if (sendCnt == 0)

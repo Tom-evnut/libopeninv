@@ -19,12 +19,14 @@
 #include "cansdo.h"
 #include "my_math.h"
 #include "errormessage.h"
+#include "sdocommands.h"
 
 #define SDO_REQ_ID_BASE       0x600U
 #define SDO_REP_ID_BASE       0x580U
 
 #define SDO_INDEX_PARAMS      0x2000
 #define SDO_INDEX_PARAM_UID   0x2100
+#define SDO_INDEX_PARAM_FLAGS 0x2200
 #define SDO_INDEX_MAP_TX      0x3000
 #define SDO_INDEX_MAP_RX      0x3001
 #define SDO_INDEX_MAP_RD      0x3100
@@ -47,11 +49,11 @@
 CanSdo::CanSdo(CanHardware* hw, CanMap* cm)
  : canHardware(hw), canMap(cm), nodeId(1), remoteNodeId(255), printRequest(-1),
    printByteIn(0), printByteOut(sizeof(printBuffer)), printTimeout(PRINT_TIMEOUT),
-   mapParam(Param::PARAM_INVALID), mapId(0), sdoReplyValid(false), sdoReplyData(0),
-   pendingUserSpaceSdo(false)
+   mapParam(Param::PARAM_INVALID), mapId(0xFFFFFFFF), mapInfo{}, sdoReplyValid(false), sdoReplyData(0)
 {
    canHardware->AddCallback(this);
    HandleClear();
+   SdoCommands::SetCanMap(cm);
 }
 
 //Somebody (perhaps us) has cleared all user messages. Register them again
@@ -67,7 +69,12 @@ void CanSdo::HandleRx(uint32_t canId, uint32_t data[2], uint8_t)
 {
    if (canId == (SDO_REQ_ID_BASE + nodeId)) //SDO request
    {
-      ProcessSDO(data);
+      SdoFrame *sdo = (SdoFrame*)data;
+
+      if (ProcessUserSpaceSdo(sdo))
+         SendSdoReply(sdo);
+      else
+         ProcessSDO(data);
    }
    else if (canId == (SDO_REP_ID_BASE + remoteNodeId))
    {
@@ -136,7 +143,7 @@ void CanSdo::InitiateSDOTransfer(uint8_t req, uint8_t nodeId, uint16_t index, ui
 }
 
 //http://www.byteme.org.uk/canopenparent/canopen/sdo-service-data-objects-canopen/
-void CanSdo::ProcessSDO(uint32_t data[2])
+void CanSdo::ProcessSDO(uint32_t* data)
 {
    SdoFrame *sdo = (SdoFrame*)data;
 
@@ -192,6 +199,29 @@ void CanSdo::ProcessSDO(uint32_t data[2])
          sdo->data = SDO_ERR_INVIDX;
       }
    }
+   else if (sdo->index == SDO_INDEX_PARAM_FLAGS)
+   {
+      Param::PARAM_NUM paramIdx = Param::NumFromId(sdo->subIndex + ((sdo->index & 0xFF) << 8));
+
+      if (paramIdx < Param::PARAM_LAST)
+      {
+         if (sdo->cmd == SDO_WRITE)
+         {
+            Param::SetFlagsRaw(paramIdx, (uint8_t)sdo->data);
+            sdo->cmd = SDO_WRITE_REPLY;
+         }
+         else if (sdo->cmd == SDO_READ)
+         {
+            sdo->data = (uint32_t)Param::GetFlag(paramIdx);
+            sdo->cmd = SDO_READ_REPLY;
+         }
+      }
+      else
+      {
+         sdo->cmd = SDO_ABORT;
+         sdo->data = SDO_ERR_INVIDX;
+      }
+   }
    else if (0 != canMap && sdo->index == SDO_INDEX_MAP_TX)
    {
       AddCanMap(sdo, false);
@@ -230,10 +260,21 @@ void CanSdo::ProcessSDO(uint32_t data[2])
          sdo->data = SDO_ERR_INVIDX;
       }
    }
+   else if (sdo->index == SDO_INDEX_STRINGS)
+   {
+      if (sdo->cmd == SDO_READ)
+      {
+         sdo->data = 65535; //this should be the size of JSON but we don't know this in advance. Hmm.
+         sdo->cmd = SDO_RESPONSE_UPLOAD | SDO_SIZE_SPECIFIED;
+         printTimeout = PRINT_TIMEOUT;
+         printByteIn = 0;
+         printByteOut = sizeof(printBuffer); //both point to the beginning of the physical buffer but virtually they are 64 bytes apart
+         printRequest = sdo->subIndex;
+      }
+   }
    else
    {
-      if (!ProcessSpecialSDOObjects(sdo))
-         return; //Don't send reply when handled by user space
+      SdoCommands::ProcessStandardCommands(sdo);
    }
    canHardware->Send(0x580 + nodeId, data);
 }
@@ -271,40 +312,13 @@ void CanSdo::PutChar(char c)
 void CanSdo::SendSdoReply(SdoFrame* sdoFrame)
 {
    canHardware->Send(0x580 + nodeId, (uint32_t*)sdoFrame);
-   pendingUserSpaceSdo = false;
-}
-
-bool CanSdo::ProcessSpecialSDOObjects(SdoFrame* sdo)
-{
-   if (sdo->index == SDO_INDEX_STRINGS)
-   {
-      if (sdo->cmd == SDO_READ)
-      {
-         sdo->data = 65535; //this should be the size of JSON but we don't know this in advance. Hmm.
-         sdo->cmd = SDO_RESPONSE_UPLOAD | SDO_SIZE_SPECIFIED;
-         printTimeout = PRINT_TIMEOUT;
-         printByteIn = 0;
-         printByteOut = sizeof(printBuffer); //both point to the beginning of the physical buffer but virtually they are 64 bytes apart
-         printRequest = sdo->subIndex;
-         return true;
-      }
-   }
-   else
-   {
-      pendingUserSpaceSdo = true;
-      pendingUserSpaceSdoFrame.cmd = sdo->cmd;
-      pendingUserSpaceSdoFrame.index = sdo->index;
-      pendingUserSpaceSdoFrame.subIndex = sdo->subIndex;
-      pendingUserSpaceSdoFrame.data = sdo->data;
-   }
-   return false;
 }
 
 void CanSdo::ReadOrDeleteCanMap(SdoFrame* sdo)
 {
    bool rx = (sdo->index & 0x80) != 0;
    uint32_t canId;
-   uint8_t itemIdx = MAX(0, sdo->subIndex - 1) / 2;
+   uint8_t itemIdx = sdo->subIndex == 0 ? 0 : (sdo->subIndex - 1) / 2;
    const CanMap::CANPOS* canPos = canMap->GetMap(rx, sdo->index & 0x3f, itemIdx, canId);
 
    if (sdo->cmd == SDO_READ)
